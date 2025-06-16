@@ -5,10 +5,6 @@ VELKOMMEN TIL STUDENT IMPLEMENTASJON AV DEVOPS
 
 versjon 0.5 (alpha)
 
-hvis man tørr å klone dette prosjektet så husk på at det er mange secrets gjemt rundt i koden man må finne å endre på
-et godt tips er at hvis secrets som er skrevet med store bokstaver, er det github secrets, ved små bokstaver så var det secrets som var opprettet i azure.
-Finn gjerne et bedre secrets håndterings system en det som er implementert for det er kaos. (bruk environment secrets i GitHub er nok bra)
-
 Husk at betalt versjon av GitHub er nok nødvendig(?) for tilgang til codeQL 
 
 Se gjerne gjennom koden, det er kommentarer som forteller hva som må gjøres videre og evt forbedringer. 
