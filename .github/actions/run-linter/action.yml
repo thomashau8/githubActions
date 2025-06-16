@@ -1,0 +1,74 @@
+# .github/actions/run-linter/action.yml
+name: 'Run Linter Checks'
+description: 'Checks out code, sets up environment with caching, and runs linter'
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: true
+  poetry-version:
+    description: 'Poetry version to use'
+    required: true
+  working-directory:
+    description: 'Directory to run commands in'
+    required: false
+    default: '.'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Cache Poetry Install Location
+      id: cache-poetry-bin
+      uses: actions/cache@v4
+      with:
+        path: ~/.local
+        key: poetry-bin-${{ runner.os }}-${{ inputs.poetry-version }}
+
+    - name: Install Poetry if not cached
+      if: steps.cache-poetry-bin.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "Installing Poetry (Cache Miss)..."
+        curl -sSL https://install.python-poetry.org | POETRY_VERSION=${{ inputs.poetry-version }} python3 -
+
+    - name: Configure Poetry and PATH
+      shell: bash
+      run: |
+        echo "Adding Poetry to PATH..."
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+        echo "Fixing Poetry permissions..."
+        chmod +x $HOME/.local/bin/poetry || true
+        chmod -R +x $HOME/.local/share/pypoetry/venv/bin/ || true
+        echo "Configuring Poetry..."
+        poetry config virtualenvs.in-project true
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Cache Poetry virtualenv
+      id: cache-venv
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.working-directory }}/.venv
+        key: venv-${{ runner.os }}-${{ inputs.python-version }}-${{ hashFiles(format('{0}/poetry.lock', inputs.working-directory)) }}
+        restore-keys: |
+          venv-${{ runner.os }}-${{ inputs.python-version }}-
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+         echo "Running poetry install to sync/validate environment..."
+         poetry install --no-interaction --no-ansi --no-root # Removed 'if' condition
+         echo "Fixing venv permissions after install..."
+         chmod -R +x ${{ inputs.working-directory }}/.venv/bin/ || true
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Run Linters (Pre-Commit)
+      run: poetry run pre-commit run --all-files
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}

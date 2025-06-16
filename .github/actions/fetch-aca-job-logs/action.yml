@@ -1,0 +1,150 @@
+# .github/actions/fetch-aca-job-logs/action.yml
+name: 'Fetch ACA Job Logs'
+description: 'Waits for an ACA Job execution to complete and fetches its logs from Log Analytics.'
+
+inputs:
+  job-name:
+    description: 'Name of the ACA Job definition in Azure'
+    required: true
+  resource-group:
+    description: 'Azure Resource Group containing the ACA Job'
+    required: true
+  execution-name:
+    description: 'The specific ACA Job execution name to monitor and fetch logs for'
+    required: true
+  azure-environment-name:
+    description: 'Name of the ACA Environment hosting the job (for Log Analytics lookup)'
+    required: true
+  wait-timeout:
+    description: 'Timeout in seconds for waiting on job execution'
+    required: false
+    default: '600'
+  log-analytics-ingestion-wait:
+    description: 'Seconds to wait after job completion before querying Log Analytics'
+    required: false
+    default: '60'
+  # --- Credentials for Azure Login (OIDC) ---
+  azure-client-id:
+    description: 'Client ID of Azure SPN'
+    required: true
+  azure-tenant-id:
+    description: 'Tenant ID of Azure SPN'
+    required: true
+  azure-subscription-id:
+    description: 'Azure Subscription ID'
+    required: true
+
+outputs:
+  final-status:
+    description: 'The final status of the job execution (Succeeded, Failed, Cancelled, Timeout, Unknown, Skipped)'
+    value: ${{ steps.wait_for_job.outputs.final_status || steps.check_execution.outputs.final_status }} # Combine possible exit points
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check if Execution Name is Provided
+      id: check_execution
+      shell: bash
+      run: |
+        if [[ -z "${{ inputs.execution-name }}" ]]; then
+          echo "::warning::No execution name provided. Skipping log retrieval."
+          # Set status output directly if skipping
+          echo "final_status=Skipped" >> $GITHUB_OUTPUT
+        else
+          echo "Execution name '${{ inputs.execution-name }}' provided. Proceeding."
+          # Indicate not skipped (step will continue)
+        fi
+
+    - name: Azure Login
+      # Only run if execution name was provided
+      if: steps.check_execution.outputs.final_status != 'Skipped'
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.azure-client-id }}
+        tenant-id: ${{ inputs.azure-tenant-id }}
+        subscription-id: ${{ inputs.azure-subscription-id }}
+
+    - name: Wait for Job Execution and Check Status
+      id: wait_for_job
+      # Only run if execution name was provided
+      if: steps.check_execution.outputs.final_status != 'Skipped'
+      shell: bash
+      run: |
+        TIMEOUT=${{ inputs.wait-timeout }}
+        INTERVAL=20
+        ELAPSED=0
+        FINAL_STATUS="Unknown" # Default if loop somehow exits early
+
+        echo "Waiting up to $TIMEOUT seconds for execution ${{ inputs.execution-name }} to finish..."
+        while true; do
+          STATUS=$(az containerapp job execution show \
+            --name               "${{ inputs.job-name }}" \
+            --resource-group     "${{ inputs.resource-group }}" \
+            --job-execution-name "${{ inputs.execution-name }}" \
+            --query properties.status -o tsv 2>/dev/null || echo "Polling")
+
+          echo "   [$ELAPSED s] Status: $STATUS"
+          case "$STATUS" in
+            Succeeded|Failed|Cancelled) FINAL_STATUS=$STATUS; break ;;
+            Polling|Running|Waiting|Pending) ;; # Continue polling
+            *) echo "::warning::Unexpected status encountered: $STATUS";;
+          esac
+
+          if (( ELAPSED >= TIMEOUT )); then
+            echo "::error::Timeout ($TIMEOUT s) waiting for execution ${{ inputs.execution-name }}"
+            FINAL_STATUS="Timeout"; break
+          fi
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+        echo "✅ Final observed status for ${{ inputs.execution-name }}: $FINAL_STATUS"
+        echo "final_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+
+    - name: Get Log Analytics Workspace ID
+      id: get_la_workspace
+      # Only run if execution name was provided
+      if: steps.check_execution.outputs.final_status != 'Skipped'
+      shell: bash
+      run: |
+        echo "Attempting to find Log Analytics Workspace ID for ACA Environment: ${{ inputs.azure-environment-name }}"
+        WS_ID=$(az containerapp env show \
+          --name "${{ inputs.azure-environment-name }}" \
+          --resource-group "${{ inputs.resource-group }}" \
+          --query "properties.appLogsConfiguration.logAnalyticsConfiguration.customerId" -o tsv)
+
+        if [[ -z "$WS_ID" ]]; then
+          echo "::warning::Could not determine Log Analytics Workspace ID. Skipping Log Analytics queries."
+          echo "workspace_id=" >> $GITHUB_OUTPUT
+        else
+          echo "Log Analytics Workspace ID found: $WS_ID"
+          echo "workspace_id=$WS_ID" >> $GITHUB_OUTPUT
+          WAIT_SECONDS=${{ inputs.log-analytics-ingestion-wait }}
+          if (( WAIT_SECONDS > 0 )); then
+             echo "Waiting ${WAIT_SECONDS}s for potential Log Analytics ingestion..."
+             sleep $WAIT_SECONDS
+          fi
+        fi
+
+    - name: Query Log Analytics for Console Logs
+      # Run if execution name provided AND workspace ID found
+      if: steps.check_execution.outputs.final_status != 'Skipped' && steps.get_la_workspace.outputs.workspace_id != ''
+      shell: bash
+      run: |
+        echo "::group::📊 Log Analytics Console Logs for Execution: ${{ inputs.execution-name }}"
+        az monitor log-analytics query \
+          --workspace "${{ steps.get_la_workspace.outputs.workspace_id }}" \
+          --analytics-query "ContainerAppConsoleLogs_CL | where ContainerGroupName_s startswith '${{ inputs.execution-name }}' | order by TimeGenerated asc | project TimeGenerated, Log_s" \
+          -o table || echo "::warning::Log Analytics query for Console Logs failed or returned no results."
+        echo "::endgroup::"
+
+    - name: Query Log Analytics for System Logs
+      # Run if execution name provided AND workspace ID found
+      if: steps.check_execution.outputs.final_status != 'Skipped' && steps.get_la_workspace.outputs.workspace_id != ''
+      shell: bash
+      run: |
+        echo "::group::📊 Log Analytics System Logs for Execution: ${{ inputs.execution-name }}"
+        az monitor log-analytics query \
+          --workspace "${{ steps.get_la_workspace.outputs.workspace_id }}" \
+          --analytics-query "ContainerAppSystemLogs_CL | where ContainerGroupName startswith '${{ inputs.execution-name }}' | order by TimeGenerated asc | project TimeGenerated, Log_s, Reason_s, Type_s" \
+          -o table || echo "::warning::Log Analytics query for System Logs failed or returned no results."
+        echo "::endgroup::"

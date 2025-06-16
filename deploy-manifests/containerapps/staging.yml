@@ -1,0 +1,62 @@
+# Template for Staging Container App
+location: Norway East
+name: staging-container
+resourceGroup: rg_my_python_app_staging
+identity:
+  type: None
+properties:
+  managedEnvironmentId: __MANAGED_ENVIRONMENT_ID_PLACEHOLDER__
+
+  configuration:
+    secrets:
+      - name: ghcr-pat-secret
+        value: __GHCR_PAT__
+      - name: db-url-staging
+      - name: secret-key-staging
+      - name: allowed-hosts-staging
+      - name: csrf-origins-staging
+      - name: azure-account-key
+
+    registries:
+      - server: ghcr.io
+        username: __REGISTRY_USERNAME__
+        passwordSecretRef: ghcr-pat-secret
+
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: Auto
+
+  template:
+    containers:
+      - name: web
+        image: __IMAGE_TO_DEPLOY__
+        resources:
+          cpu: 0.5
+          memory: 1.0Gi
+        env:
+          - name: DATABASE_URL
+            secretRef: db-url-staging
+          - name: SECRET_KEY
+            secretRef: secret-key-staging
+          - name: ALLOWED_HOSTS
+            secretRef: allowed-hosts-staging
+          - name: CSRF_TRUSTED_ORIGINS
+            secretRef: csrf-origins-staging
+          - name: AZURE_ACCOUNT_KEY
+            secretRef: azure-account-key
+
+          - name: AZURE_ACCOUNT_NAME
+            value: __AZURE_ACCOUNT_NAME__
+          - name: AZURE_CONTAINER
+            value: "static-staging"
+          - name: DEBUG
+            value: "false"
+          - name: DJANGO_SETTINGS_MODULE
+            value: "config.settings"
+          - name: DATABASE_SSL_REQUIRE
+            value: "true"
+
+    scale:
+      minReplicas: 0
+      maxReplicas: 1

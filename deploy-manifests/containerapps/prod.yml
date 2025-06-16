@@ -1,0 +1,66 @@
+# Template for Production Container App
+location: Norway East
+name: prod-container
+resourceGroup: rg_my_python_app_prod
+
+identity:
+  type: None
+
+properties:
+  managedEnvironmentId: __MANAGED_ENVIRONMENT_ID_PLACEHOLDER_PROD__
+
+  configuration:
+    secrets:
+      - name: db-url-prod
+      - name: secret-key-prod
+      - name: allowed-hosts-prod
+      - name: csrf-origins-prod
+      - name: azure-account-key
+
+      - name: ghcr-pat-secret
+        value: __GHCR_PAT__
+
+    registries:
+      - server: ghcr.io
+        username: __REGISTRY_USERNAME__
+        passwordSecretRef: ghcr-pat-secret
+
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: Auto
+
+  template:
+    containers:
+      - name: web
+        image: __IMAGE_TO_DEPLOY__
+        resources:
+          cpu: 0.5
+          memory: 1.0Gi
+        env:
+          - name: DATABASE_URL
+            secretRef: db-url-prod
+          - name: SECRET_KEY
+            secretRef: secret-key-prod
+          - name: ALLOWED_HOSTS
+            secretRef: allowed-hosts-prod
+          - name: CSRF_TRUSTED_ORIGINS
+            secretRef: csrf-origins-prod
+          - name: AZURE_ACCOUNT_KEY
+            secretRef: azure-account-key
+
+          # --- Non-secret values ---
+          - name: AZURE_ACCOUNT_NAME
+            value: __AZURE_ACCOUNT_NAME__
+          - name: AZURE_CONTAINER
+            value: "static-production"
+          - name: DEBUG
+            value: "False"
+          - name: DJANGO_SETTINGS_MODULE
+            value: "config.settings"
+          - name: DATABASE_SSL_REQUIRE
+            value: "True"
+
+    scale:
+      minReplicas: 1
+      maxReplicas: 3

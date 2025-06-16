@@ -1,0 +1,35 @@
+{
+"properties": {
+    "configuration": {
+      "registries": [
+        {
+          "server": "$REGISTRY_SERVER",
+          "username": "$REGISTRY_USERNAME",
+          "passwordSecretRef": "$REGISTRY_PASSWORD_SECRET_NAME"
+        }
+      ]
+    },
+    "template": {
+      "containers": [
+        {
+          "image": "$IMAGE_ID",
+          "name": "$JOB_NAME",
+          "command": ["/app/.venv/bin/python"],
+          "args": ["manage.py", "migrate", "--noinput"],
+          "env": [
+            {"name": "DATABASE_URL", "secretRef": "$DB_URL_SECRET_NAME"},
+            {"name": "SECRET_KEY", "secretRef": "$SECRET_KEY_SECRET_NAME"},
+            {"name": "ALLOWED_HOSTS", "secretRef": "$ALLOWED_HOSTS_SECRET_NAME"},
+            {"name": "CSRF_TRUSTED_ORIGINS", "secretRef": "$CSRF_ORIGINS_SECRET_NAME"},
+            {"name": "DJANGO_SETTINGS_MODULE", "value": "$DJANGO_SETTINGS_MODULE_VAR"},
+            {"name": "AZURE_ACCOUNT_NAME", "value": "$AZURE_ACCOUNT_NAME_VAR"},
+            {"name": "AZURE_ACCOUNT_KEY", "secretRef": "$AZURE_ACCOUNT_KEY_SECRET_NAME"},
+            {"name": "AZURE_CONTAINER", "value": "$AZURE_CONTAINER_VAR"},
+            {"name": "DATABASE_SSL_REQUIRE", "value": "True"},
+            {"name": "DEBUG", "value": "False"}
+          ]
+        }
+      ]
+    }
+  }
+}

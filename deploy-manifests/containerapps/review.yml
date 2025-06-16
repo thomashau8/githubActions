@@ -1,0 +1,58 @@
+# --- Template for Review Container App ---
+location: Norway East
+identity:
+  type: None
+properties:
+  managedEnvironmentId: __MANAGED_ENVIRONMENT_ID_REVIEW__
+
+  configuration:
+    secrets:
+      - name: ghcr-pat-secret
+        value: __GHCR_PAT__
+      - name: django-secret-key
+        value: __SECRET_KEY_REVIEW__
+      - name: django-database-url
+        value: __DATABASE_URL_REVIEW__
+      - name: azure-storage-key
+        value: __AZURE_ACCOUNT_KEY__
+
+    registries:
+      - server: ghcr.io
+        username: __REGISTRY_USERNAME__
+        passwordSecretRef: ghcr-pat-secret
+
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: Auto
+
+  template:
+    containers:
+      - name: web
+        image: __IMAGE_TO_DEPLOY__
+        resources:
+          cpu: 0.25
+          memory: 0.5Gi
+        env:
+          - name: SECRET_KEY
+            secretRef: django-secret-key
+          - name: DATABASE_URL
+            secretRef: django-database-url
+          - name: AZURE_ACCOUNT_KEY
+            secretRef: azure-storage-key
+          - name: AZURE_ACCOUNT_NAME
+            value: __AZURE_ACCOUNT_NAME__
+          - name: AZURE_CONTAINER
+            value: "static-review"
+          - name: DEBUG
+            value: "True"
+          - name: DJANGO_SETTINGS_MODULE
+            value: "config.settings"
+          - name: DATABASE_SSL_REQUIRE
+            value: "False"
+          - name: ALLOWED_HOSTS
+            value: "*"
+
+    scale:
+      minReplicas: 0
+      maxReplicas: 1

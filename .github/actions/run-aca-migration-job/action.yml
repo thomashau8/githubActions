@@ -1,0 +1,150 @@
+# .github/actions/run-aca-migration-job/action.yml
+name: 'Run ACA Migration Job'
+description: 'Updates and starts an Azure Container App Job for migrations'
+
+inputs:
+  # --- Required Inputs (keep as is) ---
+  job-name:
+    description: 'Name of the ACA Job definition in Azure'
+    required: true
+  resource-group:
+    description: 'Azure Resource Group containing the ACA Job'
+    required: true
+  image-id:
+    description: 'Full Docker Image ID to deploy (e.g., registry/repo:tag)'
+    required: true
+  azure-client-id:
+    description: 'Client ID of Azure SPN for deployment'
+    required: true
+  azure-tenant-id:
+    description: 'Tenant ID of Azure SPN'
+    required: true
+  azure-subscription-id:
+    description: 'Azure Subscription ID'
+    required: true
+  db-url-secret-name:
+    description: 'Name of the ACA secret containing the Database URL'
+    required: true
+  secret-key-secret-name:
+    description: 'Name of the ACA secret containing the Django Secret Key'
+    required: true
+  allowed-hosts-secret-name:
+    description: 'Name of the ACA secret containing Allowed Hosts'
+    required: true
+  csrf-origins-secret-name:
+    description: 'Name of the ACA secret containing CSRF Trusted Origins'
+    required: true
+  azure-account-key-secret-name:
+    description: 'Name of the ACA secret containing the Azure Storage Key'
+    required: true
+  django-settings-module:
+    description: 'Django settings module path'
+    required: true
+  azure-account-name:
+    description: 'Azure Storage Account Name'
+    required: true
+  azure-container-name:
+    description: 'Azure Blob Container Name for static files'
+    required: true
+
+  registry-server:
+    description: 'Container Registry server (e.g., ghcr.io)'
+    required: true
+  registry-username:
+    description: 'Container Registry username (e.g., github.actor)'
+    required: true
+  registry-password-secret-name:
+    description: 'Name of the ACA secret containing the registry password/PAT'
+    required: true
+
+outputs:
+  execution-name:
+    description: 'The name of the ACA Job execution that was started.'
+    value: ${{ steps.start_job.outputs.execution_name }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.azure-client-id }}
+        tenant-id: ${{ inputs.azure-tenant-id }}
+        subscription-id: ${{ inputs.azure-subscription-id }}
+
+    - name: Update Migration Job Definition using Template File
+      shell: bash
+      run: |
+        set -e
+        echo "Updating ACA Job: ${{ inputs.job-name }} using template file..."
+
+        export JOB_NAME="${{ inputs.job-name }}"
+        export IMAGE_ID="${{ inputs.image-id }}"
+        export DB_URL_SECRET_NAME="${{ inputs.db-url-secret-name }}"
+        export SECRET_KEY_SECRET_NAME="${{ inputs.secret-key-secret-name }}"
+        export ALLOWED_HOSTS_SECRET_NAME="${{ inputs.allowed-hosts-secret-name }}"
+        export CSRF_ORIGINS_SECRET_NAME="${{ inputs.csrf-origins-secret-name }}"
+        export DJANGO_SETTINGS_MODULE_VAR="${{ inputs.django-settings-module }}"
+        export AZURE_ACCOUNT_NAME_VAR="${{ inputs.azure-account-name }}"
+        export AZURE_ACCOUNT_KEY_SECRET_NAME="${{ inputs.azure-account-key-secret-name }}"
+        export AZURE_CONTAINER_VAR="${{ inputs.azure-container-name }}"
+        export REGISTRY_SERVER="${{ inputs.registry-server }}"
+        export REGISTRY_USERNAME="${{ inputs.registry-username }}"
+        export REGISTRY_PASSWORD_SECRET_NAME="${{ inputs.registry-password-secret-name }}"
+
+        TEMPLATE_FILE="${{ github.action_path }}/job-config.template.json"
+        OUTPUT_FILE="./job-config-final.json"
+
+        if [[ ! -f "$TEMPLATE_FILE" ]]; then
+          echo "::error::Template file not found at $TEMPLATE_FILE"
+          exit 1
+        fi
+
+        echo "Substituting variables in $TEMPLATE_FILE > $OUTPUT_FILE"
+        # Ensure all needed variables for the template are exported above
+        envsubst '
+        $IMAGE_ID
+        $JOB_NAME
+        $DB_URL_SECRET_NAME
+        $SECRET_KEY_SECRET_NAME
+        $ALLOWED_HOSTS_SECRET_NAME
+        $CSRF_ORIGINS_SECRET_NAME
+        $DJANGO_SETTINGS_MODULE_VAR
+        $AZURE_ACCOUNT_NAME_VAR
+        $AZURE_ACCOUNT_KEY_SECRET_NAME
+        $AZURE_CONTAINER_VAR
+        $REGISTRY_SERVER
+        $REGISTRY_USERNAME
+        $REGISTRY_PASSWORD_SECRET_NAME
+        ' < "$TEMPLATE_FILE" > "$OUTPUT_FILE"
+
+        echo "Running az containerapp job update --yaml..."
+        az containerapp job update \
+          --name "${{ inputs.job-name }}" \
+          --resource-group "${{ inputs.resource-group }}" \
+          --yaml "$OUTPUT_FILE"
+
+        echo "Job definition updated via template YAML."
+
+    - name: Start Migration Job Execution
+      id: start_job
+      shell: bash
+      run: |
+        set -euo pipefail # Ensure errors are caught
+        JOB_NAME="${{ inputs.job-name }}"
+        RESOURCE_GROUP="${{ inputs.resource-group }}"
+
+        echo "Starting migration job: $JOB_NAME"
+        EXECUTION_NAME=$(az containerapp job start \
+          --name           "$JOB_NAME" \
+          --resource-group "$RESOURCE_GROUP" \
+          --query name -o tsv)
+
+        if [[ -z "$EXECUTION_NAME" ]]; then
+          echo "::error::Failed to start job $JOB_NAME or could not retrieve execution name."
+          exit 1
+        fi
+
+        echo "Job execution started: $EXECUTION_NAME"
+        # Set the output for the step, which will be exposed by the action's outputs
+        echo "execution_name=$EXECUTION_NAME" >> $GITHUB_OUTPUT

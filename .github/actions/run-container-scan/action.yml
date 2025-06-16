@@ -1,0 +1,70 @@
+# .github/actions/run-container-scan/action.yml
+name: 'Run Container Scan'
+description: 'Runs Trivy vulnerability scan on a specified container image'
+inputs:
+  image-ref:
+    description: 'Full reference to the container image to scan (e.g., registry/repo:tag)'
+    required: true
+  severity:
+    description: 'Comma-separated list of severities to fail on'
+    required: false
+    default: 'CRITICAL,HIGH'
+  exit-code:
+    description: 'Exit code for Trivy scan failure'
+    required: false
+    default: '0' # Fail the step if vulnerabilities found
+  sarif-report-path:
+    description: 'Output path for the SARIF report'
+    required: false
+    default: 'trivy-results.sarif'
+  artifact-name:
+    description: 'Name for the SARIF report artifact'
+    required: false
+    default: 'trivy-scan-report'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@0.28.0
+      env:
+        TRIVY_USERNAME: ${{ github.actor }}
+        TRIVY_PASSWORD: ${{ github.token }}
+      with:
+        image-ref: ${{ inputs.image-ref }}
+        severity: ${{ inputs.severity }}
+        exit-code: ${{ inputs.exit-code }}
+        format: 'sarif'
+        output: ${{ inputs.sarif-report-path }}
+
+    # NEEDS CODEQL ENABLED
+    - name: Check if SARIF file exists
+      id: check_sarif
+      if: always()
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.sarif-report-path }}" ]; then
+          echo "SARIF file found: ${{ inputs.sarif-report-path }}"
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "::warning::SARIF file NOT found: ${{ inputs.sarif-report-path }}"
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload Trivy SARIF report artifact
+      if: (success() || failure()) && steps.check_sarif.outputs.exists == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.sarif-report-path }}
+        retention-days: 7
+
+      # NEEDS CODEQL ENABLED
+   # - name: Upload Trivy scan results to GitHub Security tab
+   #   if: (success() || failure()) && steps.check_sarif.outputs.exists == 'true'
+   #   uses: github/codeql-action/upload-sarif@v3
+   #   with:
+   #     sarif_file: ${{ inputs.sarif-report-path }}

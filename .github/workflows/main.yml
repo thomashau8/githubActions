@@ -1,0 +1,435 @@
+# .github/workflows/main.yml
+# GENERAL TODO NOTE:
+# Eventually swap secrets into environment secrets
+# Define environment for jobs to use specific environment dependent secrets.
+# Mostly finished, further improvements can be improving migration logic with a different solution
+# Instead of using -sed commands
+name: Staging and Production Release Pipeline
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+  checks: write
+  pull-requests: read
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "2.0.1"
+  DJANGO_MANAGE_PY_PATH: 'manage.py'
+  BANDIT_SCAN_PATH: './my_project'
+  TARGET_PORT: 8000
+  REGISTRY_NAME: ghcr.io
+  DJANGO_SETTINGS_MODULE: "config.settings"
+  AZURE_CONTAINER: static-staging # Blob storage cotnainer
+
+
+  # --- Staging Specific Azure Details ---
+  AZURE_RESOURCE_GROUP_STAGING: rg_my_python_app_staging
+  AZURE_ACA_APP_NAME_STAGING: staging-container
+  ACA_JOB_NAME_STAGING: "migrate-staging-job" # Define Staging Job Name
+  ACA_ENV_STAGING: "acae-staging-norwayeast" # Define Staging Env Name
+
+  # --- Production Specific Azure Details ---
+  AZURE_RESOURCE_GROUP_PROD: rg_my_python_app_prod
+  AZURE_ACA_APP_NAME_PROD: prod-container
+  ACA_JOB_NAME_PROD: "migrate-production-job" # Define Prod Job Name
+  ACA_ENV_PROD: "acae-prod-norwayeast" # Define Prod Env Name
+
+  # Note: AZURE_ACCOUNT_NAME might be better as a specific secret per env later
+  AZURE_ACCOUNT_NAME: ${{ secrets.AZURE_ACCOUNT_NAME }}
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-linter
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          poetry-version: ${{ env.POETRY_VERSION }}
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb
+      DEBUG: "True"
+      DATABASE_SSL_REQUIRE: "False"
+      DJANGO_ENV: development
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          poetry-version: ${{ env.POETRY_VERSION }}
+          django-manage-py-path: ${{ env.DJANGO_MANAGE_PY_PATH }}
+          pytest-cov-options: '--cov=my_project --cov-report=term'
+          coverage-artifact-name: 'main-coverage-report'
+
+  security_checks:
+    name: Security Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-security-checks
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          bandit-scan-path: ${{ env.BANDIT_SCAN_PATH }}
+
+  build_image:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: [lint, test, security_checks]
+    outputs:
+      image_name_full: ${{ steps.set-names.outputs.image_name_full }}
+      image_name_base: ${{ steps.set-names.outputs.image_name_base }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image names
+        id: set-names
+        shell: bash
+        run: |
+          set -e
+          COMMIT_SHA="${{ github.sha }}"
+          IMAGE_TAG="${COMMIT_SHA::7}"
+          REPO_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME="${{ github.event.repository.name }}"
+          IMAGE_NAME_BASE="${{ env.REGISTRY_NAME }}/${REPO_OWNER_LOWER}/${REPO_NAME}"
+          IMAGE_NAME_FULL="${IMAGE_NAME_BASE}:${IMAGE_TAG}"
+          echo "image_name_base=${IMAGE_NAME_BASE}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_name_full=${IMAGE_NAME_FULL}" >> $GITHUB_OUTPUT
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_NAME }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push release candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.set-names.outputs.image_name_full }}
+            ${{ steps.set-names.outputs.image_name_base }}:latest
+          cache-from: |
+            type=registry,ref=${{ steps.set-names.outputs.image_name_base }}:latest
+            type=registry,ref=${{ steps.set-names.outputs.image_name_base }}:buildcache
+          cache-to: type=registry,ref=${{ steps.set-names.outputs.image_name_base }}:buildcache,mode=max
+
+  container_scan:
+    name: Container Scan
+    runs-on: ubuntu-latest
+    needs: build_image
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - uses: ./.github/actions/run-container-scan
+        with:
+          image-ref: ${{ needs.build_image.outputs.image_name_full }}
+
+  migrate_staging:
+    name: Migrate Staging Database
+    runs-on: ubuntu-latest
+    needs: [ build_image, container_scan ]
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      execution_name: ${{ steps.run_migration_job.outputs.execution-name }}
+      job_name: ${{ env.ACA_JOB_NAME_STAGING }}
+      resource_group: ${{ env.AZURE_RESOURCE_GROUP_STAGING }}
+      environment_name: ${{ env.ACA_ENV_STAGING }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run ACA Migration Job Action (Start Only)
+        id: run_migration_job
+        uses: ./.github/actions/run-aca-migration-job
+        with:
+          job-name: ${{ env.ACA_JOB_NAME_STAGING }}
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP_STAGING }}
+          image-id: ${{ needs.build_image.outputs.image_name_full }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID_STAGING }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID_STAGING }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGING }}
+          db-url-secret-name: db-url-staging
+          secret-key-secret-name: secret-key-staging
+          allowed-hosts-secret-name: allowed-hosts-staging
+          csrf-origins-secret-name: csrf-origins-staging
+          azure-account-key-secret-name: azure-account-key
+          django-settings-module: ${{ env.DJANGO_SETTINGS_MODULE }}
+          azure-account-name: ${{ env.AZURE_ACCOUNT_NAME }}
+          azure-container-name: "static-staging"
+          registry-server: ghcr.io
+          registry-username: ${{ github.actor }}
+          registry-password-secret-name: ghcr-pat-secret
+  #TODO FAIL PIPELINE ON FAILURE
+  fetch_migration_logs:
+    name: Wait For & Fetch Migration Logs
+    needs: migrate_staging
+    if: always()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch Logs Using Reusable Action
+        id: fetch_logs
+        uses: ./.github/actions/fetch-aca-job-logs
+        with:
+          job-name: ${{ needs.migrate_staging.outputs.job_name }}
+          resource-group: ${{ needs.migrate_staging.outputs.resource_group }}
+          execution-name: ${{ needs.migrate_staging.outputs.execution_name }}
+          azure-environment-name: ${{ needs.migrate_staging.outputs.environment_name }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID_STAGING }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID_STAGING }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGING }}
+
+  deploy_staging:
+    name: Deploy to Staging (Action with YAML)
+    runs-on: ubuntu-latest
+    needs: [ build_image, migrate_staging ]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (Staging)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_STAGING }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_STAGING }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGING }}
+
+      - name: Prepare Staging Manifest from Template
+        id: prep_manifest_staging
+        env:
+          IMAGE_TO_DEPLOY_VAR: ${{ needs.build_image.outputs.image_name_full }}
+          GHCR_PAT_VAR: ${{ secrets.GHCR_PAT }}
+          REGISTRY_USERNAME_VAR: ${{ github.actor }}
+          AZURE_ACCOUNT_NAME_VAR: ${{ env.AZURE_ACCOUNT_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGING }}
+          AZURE_RESOURCE_GROUP_STAGING: ${{ env.AZURE_RESOURCE_GROUP_STAGING }}
+          ACA_ENV_STAGING: ${{ env.ACA_ENV_STAGING }}
+        shell: bash
+        run: |
+          set -e
+          MANIFEST_TEMPLATE="deploy-manifests/containerapps/staging.yml"
+          OUTPUT_MANIFEST="./staging-manifest-final.yaml"
+          if [[ ! -f "$MANIFEST_TEMPLATE" ]]; then echo "ERROR: Template not found at $MANIFEST_TEMPLATE"; exit 1; fi
+          echo "Using template: $MANIFEST_TEMPLATE"
+          cp "$MANIFEST_TEMPLATE" "$OUTPUT_MANIFEST"
+          MANAGED_ENV_ID="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP_STAGING/providers/Microsoft.App/managedEnvironments/$ACA_ENV_STAGING"
+          echo "Substituting placeholders..."
+          sed -i "s|__IMAGE_TO_DEPLOY__|${IMAGE_TO_DEPLOY_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__GHCR_PAT__|${GHCR_PAT_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__REGISTRY_USERNAME__|${REGISTRY_USERNAME_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__AZURE_ACCOUNT_NAME__|${AZURE_ACCOUNT_NAME_VAR}|g" "$OUTPUT_MANIFEST"
+          MANAGED_ENV_ID_ESCAPED=$(echo "$MANAGED_ENV_ID" | sed 's/\//\\\//g')
+          sed -i "s/__MANAGED_ENVIRONMENT_ID_PLACEHOLDER__/${MANAGED_ENV_ID_ESCAPED}/g" "$OUTPUT_MANIFEST"
+          echo "Prepared staging manifest path: ${OUTPUT_MANIFEST}"
+          echo "--- Final Manifest Content ---"; cat $OUTPUT_MANIFEST; echo "------------------------------"
+          echo "manifest_path=${OUTPUT_MANIFEST}" >> $GITHUB_OUTPUT
+
+      - name: Deploy Staging App
+        id: deploy_staging
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          yamlConfigPath: ${{ steps.prep_manifest_staging.outputs.manifest_path }}
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP_STAGING }}
+          containerAppName: ${{ env.AZURE_ACA_APP_NAME_STAGING }}
+
+  # approval: NEEDS PAID VERSION OF GITHUB
+  #   name: Approve Production Deployment
+  #   runs-on: ubuntu-latest
+  #   needs: deploy_staging
+  #   environment: production
+  #   steps:
+  #     - run: echo "Awaiting manual approval for Production deployment."
+
+  # --- Migrate Production DB ---
+  migrate_production:
+    name: Migrate Production Database
+    runs-on: ubuntu-latest
+    needs: [ deploy_staging, build_image ]
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      execution_name: ${{ steps.run_prod_migration_job.outputs.execution-name }}
+      job_name: ${{ env.ACA_JOB_NAME_PROD }}
+      resource_group: ${{ env.AZURE_RESOURCE_GROUP_PROD }}
+      environment_name: ${{ env.ACA_ENV_PROD }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Production)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+        # Purely for logging purposes, currently ACA Job must be self-made in Azure
+        # Could potentially be expanded to automatically create ACA Job.
+      - name: Ensure ACA Job Definition Exists
+        run: |
+          echo "Checking/Ensuring ACA Job definition exists: ${{ env.ACA_JOB_NAME_PROD }}"
+          # Basic check, assumes environment exists. Add create logic if needed.
+          az containerapp job show --name "${{ env.ACA_JOB_NAME_PROD }}" --resource-group "${{ env.AZURE_RESOURCE_GROUP_PROD }}" --output none \
+            || echo "::warning::Job definition not found. Ensure it's created or handled." \
+            # Consider adding 'az containerapp job create ...' logic here if desired,
+
+      - name: Run ACA Migration Job Action (Start Only)
+        id: run_prod_migration_job
+        uses: ./.github/actions/run-aca-migration-job
+        with:
+          job-name: ${{ env.ACA_JOB_NAME_PROD }}
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP_PROD }}
+          image-id: ${{ needs.build_image.outputs.image_name_full }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+          db-url-secret-name: db-url-prod
+          secret-key-secret-name: secret-key-prod
+          allowed-hosts-secret-name: allowed-hosts-prod
+          csrf-origins-secret-name: csrf-origins-prod
+          azure-account-key-secret-name: azure-account-key
+          django-settings-module: ${{ env.DJANGO_SETTINGS_MODULE }}
+          azure-account-name: ${{ env.AZURE_ACCOUNT_NAME }}
+          azure-container-name: "static-production" # TURN THIS INTO VARIABLE, NOT HARDCODED
+          registry-server: ghcr.io
+          registry-username: ${{ github.actor }}
+          registry-password-secret-name: ghcr-pat-secret
+
+  #TODO FAIL PIPELINE ON FAILURE
+  fetch_production_logs:
+    name: Wait For & Fetch Production Logs
+    runs-on: ubuntu-latest
+    needs: [ migrate_production ]
+    if: always()
+    continue-on-error: true
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch Logs Using Reusable Action
+        id: fetch_prod_logs
+        uses: ./.github/actions/fetch-aca-job-logs
+        with:
+          job-name: ${{ needs.migrate_production.outputs.job_name }}
+          resource-group: ${{ needs.migrate_production.outputs.resource_group }}
+          execution-name: ${{ needs.migrate_production.outputs.execution_name }}
+          azure-environment-name: ${{ needs.migrate_production.outputs.environment_name }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+  deploy_production:
+    name: Deploy to Production App
+    runs-on: ubuntu-latest
+    needs: [ migrate_production, build_image ]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (Production)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Prepare Production Manifest from Template
+        id: prep_manifest_prod
+        env:
+          IMAGE_TO_DEPLOY_VAR: ${{ needs.build_image.outputs.image_name_full }}
+          GHCR_PAT_VAR: ${{ secrets.GHCR_PAT }}
+          REGISTRY_USERNAME_VAR: ${{ github.actor }}
+          AZURE_ACCOUNT_NAME_VAR: ${{ env.AZURE_ACCOUNT_NAME }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+          AZURE_RESOURCE_GROUP_PROD: ${{ env.AZURE_RESOURCE_GROUP_PROD }}
+          ACA_ENV_PROD: ${{ env.ACA_ENV_PROD }}
+        shell: bash
+        run: |
+          set -e
+          MANIFEST_TEMPLATE="deploy-manifests/containerapps/prod.yml"
+          OUTPUT_MANIFEST="./prod-manifest-final.yaml"
+
+          if [[ ! -f "$MANIFEST_TEMPLATE" ]]; then
+            echo "ERROR: Production manifest template not found at $MANIFEST_TEMPLATE"
+            exit 1
+          fi
+          echo "Using production manifest template: $MANIFEST_TEMPLATE"
+          cp "$MANIFEST_TEMPLATE" "$OUTPUT_MANIFEST"
+
+          # --- Construct Production Managed Environment ID ---
+          MANAGED_ENV_ID="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP_PROD/providers/Microsoft.App/managedEnvironments/$ACA_ENV_PROD"
+          echo "Constructed Production Managed Environment ID: $MANAGED_ENV_ID"
+          # ---
+
+          # --- Substitute only the required placeholders ---
+          echo "Substituting placeholders..."
+          sed -i "s|__IMAGE_TO_DEPLOY__|${IMAGE_TO_DEPLOY_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__GHCR_PAT__|${GHCR_PAT_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__REGISTRY_USERNAME__|${REGISTRY_USERNAME_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__AZURE_ACCOUNT_NAME__|${AZURE_ACCOUNT_NAME_VAR}|g" "$OUTPUT_MANIFEST"
+          MANAGED_ENV_ID_ESCAPED=$(echo "$MANAGED_ENV_ID" | sed 's/\//\\\//g')
+          sed -i "s/__MANAGED_ENVIRONMENT_ID_PLACEHOLDER_PROD__/${MANAGED_ENV_ID_ESCAPED}/g" "$OUTPUT_MANIFEST"
+
+          echo "Prepared production manifest path: ${OUTPUT_MANIFEST}"
+          echo "--- Final Production Manifest Content ---"; cat $OUTPUT_MANIFEST; echo "-------------------------------------"
+          echo "manifest_path=${OUTPUT_MANIFEST}" >> $GITHUB_OUTPUT
+
+      - name: Deploy Production App
+        id: deploy_prod
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          yamlConfigPath: ${{ steps.prep_manifest_prod.outputs.manifest_path }}
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP_PROD }}
+          containerAppName: ${{ env.AZURE_ACA_APP_NAME_PROD }}

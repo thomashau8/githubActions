@@ -1,0 +1,550 @@
+# .github/workflows/review-environments.yml
+# Core functionality is implemented
+# Needs following:
+# Break down scripts into separate script files to reduce complexity in workflow
+# Implement ACA Job to allow DB connection for DB Copy & Dump between prod or staging db
+# Double check copy & dump logic
+# Modularize logic by creating config files
+# Create, Deploy, Review, all works (Issue could occur by untested DB Migration / copy & dump (?)
+# Look into changing migration logic to use "run-aca-migration-job" similar to prod/Staging
+# Data anonymization if you care about hiding (potentially) sensitive data in logs during psql dump etc
+name: Deploy & Cleanup Review Environment
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  pull-requests: write
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "2.0.1"
+  REGISTRY_NAME: ghcr.io
+  TARGET_PORT: 8000
+  # --- Review Environment Azure Details ---
+  AZURE_RESOURCE_GROUP_REVIEW: rg_my_python_app_review
+  ACA_ENVIRONMENT_NAME: acae-review-norwayeast
+  # --- Project Specifics ---
+  DJANGO_MANAGE_PY_PATH: 'manage.py'
+  PYTEST_COV_OPTIONS: '--cov=my_project --cov-report=term'
+  BANDIT_SCAN_PATH: './my_project'
+  DJANGO_SETTINGS_MODULE: "config.settings"
+  # --- Database --- # Change this to a secret if desired.
+  REVIEW_DB_NAME: postgres # DB to connect to for admin tasks (schema creation)
+
+# Prevent concurrent runs for the same branch/PR, cancel older runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Code
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/run-linter
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          poetry-version: ${{ env.POETRY_VERSION }}
+
+  test:
+    name: Run Tests
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb
+      SECRET_KEY: test-secret-key # dummy key, can be changed into secret if desirable
+      DEBUG: "True"
+      DATABASE_SSL_REQUIRE: "False"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Tests & Coverage
+        uses: ./.github/actions/run-tests
+        with:
+          python-version:        ${{ env.PYTHON_VERSION }}
+          poetry-version:        ${{ env.POETRY_VERSION }}
+          django-manage-py-path: ${{ env.DJANGO_MANAGE_PY_PATH }}
+          pytest-cov-options:    ${{ env.PYTEST_COV_OPTIONS }}
+          coverage-artifact-name: '' # No artifact needed here
+
+  security_checks:
+    name: Security Checks
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/run-security-checks
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          bandit-scan-path: ${{ env.BANDIT_SCAN_PATH }}
+
+  build_image_review:
+    name: Build Review App Image
+    runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
+    needs: [lint, test, security_checks]
+    outputs:
+      image_name_full: ${{ steps.set-names.outputs.image_name_full }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set image names for Review
+        id: set-names
+        shell: bash
+        run: |
+          set -e
+          IMAGE_TAG="${{ github.sha }}" # Use full SHA for review uniqueness
+          REPO_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME="${{ github.event.repository.name }}"
+          IMAGE_NAME_BASE="${{ env.REGISTRY_NAME }}/${REPO_OWNER_LOWER}/${REPO_NAME}"
+          IMAGE_NAME_FULL="${IMAGE_NAME_BASE}:${IMAGE_TAG}"
+          echo "image_name_full=${IMAGE_NAME_FULL}" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_NAME }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Review Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.set-names.outputs.image_name_full }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  setup_review_database:
+    name: Setup Review Database
+    runs-on: ubuntu-latest
+    needs: [build_image_review]
+    if: github.event.action != 'closed'
+    outputs:
+      review_db_url: ${{ steps.create_db_resources.outputs.review_db_url }}
+      schema_name: ${{ steps.set_names.outputs.schema_name }}
+      app_db_user: ${{ steps.create_db_resources.outputs.app_db_user }}
+      app_name: ${{ steps.set_names.outputs.app_name }}
+    env: # Make secrets available as env vars in this job
+      # Review Server Admin Credentials (using secrets)
+      REVIEW_DB_HOST: ${{ secrets.REVIEW_STAGING_DB_HOST }}
+      REVIEW_DB_PORT: ${{ secrets.REVIEW_STAGING_DB_PORT || '5432' }}
+      REVIEW_DB_NAME: ${{ env.REVIEW_DB_NAME }} # Using 'postgres' from job env
+      REVIEW_DB_ADMIN_USER: ${{ secrets.REVIEW_DB_ADMIN_USER }}
+      REVIEW_DB_ADMIN_PASSWORD: ${{ secrets.REVIEW_DB_ADMIN_PASSWORD }}
+      # Source (Staging) DB Read-Only Credentials (using secrets)
+      SOURCE_DB_HOST: ${{ secrets.REVIEW_STAGING_DB_HOST }} # Assuming same host
+      SOURCE_DB_PORT: ${{ secrets.REVIEW_STAGING_DB_PORT || '5432' }} # Assuming same port
+      SOURCE_DB_NAME: ${{ secrets.REVIEW_STAGING_DB_NAME }} # The actual Staging DB name
+      SOURCE_DB_USER: ${{ secrets.REVIEW_STAGING_DB_USER }} # Read-only user for Staging DB
+      SOURCE_DB_PASSWORD: ${{ secrets.REVIEW_STAGING_DB_PASSWORD }} # Password for read-only user
+      # Django/Python specific needed for migrations
+      PYTHON_VERSION: ${{ env.PYTHON_VERSION }}
+      POETRY_VERSION: ${{ env.POETRY_VERSION }}
+      # Other Django settings vars needed for manage.py migrate
+      SECRET_KEY: ${{ secrets.SECRET_KEY_REVIEW }}
+      AZURE_ACCOUNT_NAME: ${{ secrets.AZURE_ACCOUNT_NAME }}
+      DEBUG: "False"
+      DATABASE_SSL_REQUIRE: "False"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+      - name: Set Dynamic Names # Needs schema_name, app_name, maybe unique user/pass
+        id: set_names
+        shell: bash
+        run: |
+          set -e
+          # --- Generate unique names ---
+          raw_ref="${{ github.head_ref }}"
+          branch_slug=$(echo "$raw_ref" | sed -e 's|[^a-zA-Z0-9]|-|g' | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-zA-Z0-9-]*//g' | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-20)
+          # Ensure slug is not empty if branch name was weird
+          [[ -z "$branch_slug" ]] && branch_slug="pr${{ github.event.number }}"
+
+          # App name for Container App
+          app_name="rev-${branch_slug}-${{ github.run_id }}" # Add run_id for more uniqueness if needed
+          app_name=$(echo "$app_name" | cut -c1-32) # ACA name limit
+          echo "app_name=${app_name}" >> $GITHUB_OUTPUT
+
+          # Schema name (valid PG identifier, lowercase, underscore)
+          schema_name="rev_${branch_slug//-/_}_${{ github.run_id }}" # Replace hyphens, add run_id
+          schema_name=$(echo "$schema_name" | cut -c1-50) # Max length for identifiers
+          echo "schema_name=${schema_name}" >> $GITHUB_OUTPUT
+
+          # Generate a unique user/password for the app
+          app_db_user="app_${branch_slug//-/_}_${{ github.run_id }}"
+          app_db_user=$(echo "$app_db_user" | cut -c1-50)
+          echo "app_db_user=${app_db_user}" >> $GITHUB_OUTPUT
+          app_db_password=$(openssl rand -hex 16)
+          echo "::add-mask::${app_db_password}" # Mask password in logs
+          echo "app_db_password=${app_db_password}" >> $GITHUB_OUTPUT
+
+      - name: Create Schema, User, Grant Privs, and Construct DB URL
+        id: create_db_resources
+        shell: bash
+        run: |
+          set -e
+          SCHEMA_NAME="${{ steps.set_names.outputs.schema_name }}"
+          APP_DB_USER="${{ steps.set_names.outputs.app_db_user }}"
+          APP_DB_PASSWORD="${{ steps.set_names.outputs.app_db_password }}"
+
+          echo "Creating Schema: $SCHEMA_NAME and User: $APP_DB_USER on Host: $REVIEW_DB_HOST"
+
+          # Connect as ADMIN to REVIEW DB Server
+          export PGPASSWORD=$REVIEW_DB_ADMIN_PASSWORD
+
+          # 1. Create Schema
+          psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --command="CREATE SCHEMA IF NOT EXISTS \"$SCHEMA_NAME\";"
+
+          # 2. Create dedicated App User
+          psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --command="CREATE USER \"$APP_DB_USER\" WITH PASSWORD '$APP_DB_PASSWORD';"
+
+          # 3. Grant connect and usage on schema
+          psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" \
+            --command="GRANT CONNECT ON DATABASE \"$REVIEW_DB_NAME\" TO \"$APP_DB_USER\";" \
+            --command="GRANT USAGE ON SCHEMA \"$SCHEMA_NAME\" TO \"$APP_DB_USER\";"
+
+          # 4. Grant default app privileges within the schema
+          psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" \
+            --command="ALTER DEFAULT PRIVILEGES IN SCHEMA \"$SCHEMA_NAME\" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$APP_DB_USER\";" \
+            --command="ALTER DEFAULT PRIVILEGES IN SCHEMA \"$SCHEMA_NAME\" GRANT USAGE, SELECT ON SEQUENCES TO \"$APP_DB_USER\";" \
+            --command="ALTER DEFAULT PRIVILEGES IN SCHEMA \"$SCHEMA_NAME\" GRANT EXECUTE ON FUNCTIONS TO \"$APP_DB_USER\";"
+
+          # 5. Grant privileges on existing objects (relevant AFTER restore, but safe here too)
+          psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" \
+             --command="GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"$SCHEMA_NAME\" TO \"$APP_DB_USER\";" \
+             --command="GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"$SCHEMA_NAME\" TO \"$APP_DB_USER\";" \
+             --command="GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA \"$SCHEMA_NAME\" TO \"$APP_DB_USER\";"
+
+          unset PGPASSWORD # Unset admin password
+
+          echo "Schema and user created."
+
+          # --- Construct the Database URL for the Application ---
+          # Use the NEWLY CREATED user/pass, and set the search_path
+          ENCODED_SCHEMA_NAME=$(echo "$SCHEMA_NAME" | sed 's/"/%22/g')
+          REVIEW_DB_URL="postgres://${APP_DB_USER}:${APP_DB_PASSWORD}@${REVIEW_DB_HOST}:${REVIEW_DB_PORT}/${REVIEW_DB_NAME}?options=-csearch_path%3D${ENCODED_SCHEMA_NAME}%2Cpublic"
+          echo "Constructed Review DB URL (credentials masked): postgres://${APP_DB_USER}:***@${REVIEW_DB_HOST}:${REVIEW_DB_PORT}/${REVIEW_DB_NAME}?options=-csearch_path%3D${ENCODED_SCHEMA_NAME}%2Cpublic"
+
+          echo "::add-mask::${REVIEW_DB_URL}" # Mask the full URL in logs
+          echo "review_db_url=${REVIEW_DB_URL}" >> $GITHUB_OUTPUT
+          echo "app_db_user=${APP_DB_USER}" >> $GITHUB_OUTPUT
+
+      - name: Dump Staging DB (Public Schema)
+        shell: bash
+        run: |
+          set -e
+          echo "Dumping public schema from Staging DB: $SOURCE_DB_HOST/$SOURCE_DB_NAME"
+          export PGPASSWORD=$SOURCE_DB_PASSWORD
+          pg_dump \
+            --host="$SOURCE_DB_HOST" \
+            --port="$SOURCE_DB_PORT" \
+            --username="$SOURCE_DB_USER" \
+            --dbname="$SOURCE_DB_NAME" \
+            --schema=public \
+            --format=c \
+            --blobs \
+            --no-owner \
+            --no-privileges \
+            --clean --if-exists \
+            -f staging_public_dump.dump
+          unset PGPASSWORD
+          echo "Staging dump complete."
+          # WARNING: Add anonymization/masking steps HERE if dealing with sensitive data
+
+      - name: Restore Staging Dump to Review Schema
+        shell: bash
+        run: |
+          set -e
+          SCHEMA_NAME="${{ steps.set_names.outputs.schema_name }}"
+          echo "Restoring dump into Review Schema: $SCHEMA_NAME on $REVIEW_DB_HOST"
+          # Restore using the ADMIN user
+          export PGPASSWORD=$REVIEW_DB_ADMIN_PASSWORD
+          pg_restore \
+            --host="$REVIEW_DB_HOST" \
+            --port="$REVIEW_DB_PORT" \
+            --username="$REVIEW_DB_ADMIN_USER" \
+            --dbname="$REVIEW_DB_NAME" \
+            --no-owner \
+            --no-privileges \
+            --exit-on-error \
+            --single-transaction \
+            --clean --if-exists \
+            --schema="$SCHEMA_NAME" \
+             staging_public_dump.dump
+            # Removed the -c "SET search_path..." from here, letting the user's connection string handle it.
+            # Added --schema="$SCHEMA_NAME" to pg_restore to explicitly target the schema during restore.
+          unset PGPASSWORD
+          echo "Restore complete."
+
+      # --- START: Apply PR Migrations ---
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry ${{ env.POETRY_VERSION }}
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+          virtualenvs-create: true
+          virtualenvs-in-project: true # Recommended for caching
+
+      - name: Load cached venv
+        id: cached-poetry-dependencies-review
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-review-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies-review.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
+
+      - name: Run Review DB Migrations
+        env:
+          DATABASE_URL: ${{ steps.create_db_resources.outputs.review_db_url }}
+        run: |
+          set -e
+          echo "Running Django migrations for the review environment..."
+          # Ensure the command runs within the project directory if manage.py isn't at root
+          # cd your_project_directory # Uncomment and adjust if needed
+          poetry run python manage.py migrate --noinput
+          echo "Migrations complete."
+      # --- END: Apply PR Migrations ---
+
+  deploy_review_app:
+    name: Deploy Review App & Comment
+    runs-on: ubuntu-latest
+    needs: [setup_review_database]
+    if: github.event.action != 'closed'
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Review)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_REVIEW }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_REVIEW }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_REVIEW }}
+
+      - name: Prepare Review Manifest from Template
+        id: prep_manifest
+        shell: bash
+        run: |
+          set -e
+          # --- VERIFY THIS PATH CAREFULLY ---
+          MANIFEST_TEMPLATE="deploy-manifests/containerapps/review.yml"
+          OUTPUT_MANIFEST="./review-manifest-final.yml"
+
+          if [[ ! -f "$MANIFEST_TEMPLATE" ]]; then
+            echo "ERROR: Manifest template not found at $MANIFEST_TEMPLATE"
+            exit 1
+          fi
+          echo "Using manifest template: $MANIFEST_TEMPLATE"
+          cp "$MANIFEST_TEMPLATE" "$OUTPUT_MANIFEST"
+
+          IMAGE_NAME_FULL_VAR="${{ needs.build_image_review.outputs.image_name_full }}"
+          GHCR_PAT_SECRET_VAR="${{ secrets.GHCR_PAT }}"
+          SECRET_KEY_SECRET_VAR="${{ secrets.SECRET_KEY_REVIEW }}"
+          DATABASE_URL_SECRET_VAR="${{ needs.setup_review_database.outputs.review_db_url }}"
+          AZURE_KEY_SECRET_VAR="${{ secrets.AZURE_ACCOUNT_KEY }}"
+          REGISTRY_USERNAME_ENV_VAR="${{ github.actor }}"
+          AZURE_ACCOUNT_NAME_ENV_VAR="${{ secrets.AZURE_ACCOUNT_NAME }}"
+
+          # --- Perform substitutions ---
+          # Use | as delimiter for sed to avoid issues with slashes in URLs/secrets
+          sed -i "s|__IMAGE_TO_DEPLOY__|${IMAGE_NAME_FULL_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__GHCR_PAT__|${GHCR_PAT_SECRET_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__SECRET_KEY_REVIEW__|${SECRET_KEY_SECRET_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__DATABASE_URL_REVIEW__|${DATABASE_URL_SECRET_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__AZURE_ACCOUNT_KEY__|${AZURE_KEY_SECRET_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__REGISTRY_USERNAME__|${REGISTRY_USERNAME_ENV_VAR}|g" "$OUTPUT_MANIFEST"
+          sed -i "s|__AZURE_ACCOUNT_NAME__|${AZURE_ACCOUNT_NAME_ENV_VAR}|g" "$OUTPUT_MANIFEST"
+
+          echo "Prepared manifest saved to: ${OUTPUT_MANIFEST}"
+          cat "${OUTPUT_MANIFEST}" # Output the final manifest for debugging (optional)
+          echo "manifest_path=${OUTPUT_MANIFEST}" >> $GITHUB_OUTPUT
+
+      - name: Deploy Review App via Action
+        id: deploy
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          yamlConfigPath: ${{ steps.prep_manifest.outputs.manifest_path }}
+          containerAppName: ${{ needs.setup_review_database.outputs.app_name }}
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP_REVIEW }}
+
+      - name: Comment PR with Deployment URL
+        if: success() && steps.deploy.outputs.fqdn
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: review-environment-deployment
+          message: |
+            **Review Environment Deployed:**
+
+            App Name: `${{ needs.setup_review_database.outputs.app_name }}`
+            URL: `https://${{ steps.deploy.outputs.fqdn }}`
+            Branch: `${{ github.head_ref }}`
+
+            *Database seeded from Staging DB `${{ secrets.REVIEW_STAGING_DB_NAME }}` on host `${{ secrets.REVIEW_STAGING_DB_HOST }}`.*
+            *PR-specific migrations applied.*
+
+            *Note: Environment will be automatically cleaned up when the PR is closed.*
+
+      - name: Comment PR on deploy failure
+        if: failure()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: review-environment-deployment
+          message: |
+            **Review Environment Deployment Failed:**
+
+            Attempted App Name: `${{ needs.setup_review_database.outputs.app_name }}`
+            Branch: `${{ github.head_ref }}`
+
+            Check [Actions logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+
+  cleanup_review_app:
+    name: Cleanup Review Environment
+    runs-on: ubuntu-latest
+    if: github.event.action == 'closed'
+    needs: [setup_review_database]
+    permissions:
+      id-token: write
+      pull-requests: write
+    env:
+      REVIEW_DB_HOST: ${{ secrets.REVIEW_STAGING_DB_HOST }}
+      REVIEW_DB_PORT: ${{ secrets.REVIEW_STAGING_DB_PORT || '5432' }} #change this
+      REVIEW_DB_NAME: ${{ env.REVIEW_DB_NAME }}
+      REVIEW_DB_ADMIN_USER: ${{ secrets.REVIEW_DB_ADMIN_USER }}
+      REVIEW_DB_ADMIN_PASSWORD: ${{ secrets.REVIEW_DB_ADMIN_PASSWORD }}
+      AZURE_RESOURCE_GROUP_REVIEW: ${{ env.AZURE_RESOURCE_GROUP_REVIEW }}
+    steps:
+      - name: Azure Login (Review)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_REVIEW }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_REVIEW }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_REVIEW }}
+
+      - name: Delete Azure Container App (if name exists)
+        id: delete_app
+        shell: bash
+        run: |
+          set -e
+          APP_NAME="${{ needs.setup_review_database.outputs.app_name }}"
+          if [[ -z "$APP_NAME" ]]; then
+            exit 0
+          fi
+          az containerapp delete --name "$APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP_REVIEW" --yes || echo "App '$APP_NAME' not found or already deleted."
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+      - name: Drop Review Schema and User (if names exist)
+        id: drop_db_resources
+        shell: bash
+        run: |
+          set -e
+          SCHEMA_NAME="${{ needs.setup_review_database.outputs.schema_name }}"
+          APP_DB_USER="${{ needs.setup_review_database.outputs.app_db_user }}"
+
+          if [[ -z "$SCHEMA_NAME" || -z "$APP_DB_USER" ]]; then
+            echo "Schema or App DB User name is empty, skipping database cleanup."
+            exit 0
+          fi
+
+          echo "Dropping Schema: $SCHEMA_NAME and User: $APP_DB_USER on Host: $REVIEW_DB_HOST"
+          export PGPASSWORD=$REVIEW_DB_ADMIN_PASSWORD
+
+          # Check if schema exists before dropping
+          SCHEMA_EXISTS=$(psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --tuples-only --command="SELECT 1 FROM information_schema.schemata WHERE schema_name = '$SCHEMA_NAME';")
+          if [[ "$SCHEMA_EXISTS" -eq 1 ]]; then
+              echo "Schema '$SCHEMA_NAME' found. Dropping..."
+              psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --command="DROP SCHEMA \"$SCHEMA_NAME\" CASCADE;"
+          else
+              echo "Schema '$SCHEMA_NAME' not found, skipping drop."
+          fi
+
+          # Check if user exists before dropping
+          USER_EXISTS=$(psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --tuples-only --command="SELECT 1 FROM pg_catalog.pg_user WHERE usename = '$APP_DB_USER';")
+          if [[ "$USER_EXISTS" -eq 1 ]]; then
+             echo "User '$APP_DB_USER' found. Dropping..."
+             psql --host="$REVIEW_DB_HOST" --port="$REVIEW_DB_PORT" --username="$REVIEW_DB_ADMIN_USER" --dbname="$REVIEW_DB_NAME" --command="DROP USER \"$APP_DB_USER\";"
+          else
+             echo "User '$APP_DB_USER' not found, skipping drop."
+          fi
+
+          unset PGPASSWORD
+          echo "Database resources cleanup attempt complete."
+
+      - name: Comment PR confirming cleanup
+        if: success()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: review-environment-cleanup
+          recreate: true
+          message: |
+            **Review Environment Cleaned Up:**
+
+            Attempted cleanup for branch `${{ github.head_ref }}` (closed).
+            App Name: `${{ needs.setup_review_database.outputs.app_name }}` (deletion attempted)
+            Database Schema: `${{ needs.setup_review_database.outputs.schema_name }}` (deletion attempted)
+            Database User: `${{ needs.setup_review_database.outputs.app_db_user }}` (deletion attempted)
+
+      - name: Comment PR on cleanup failure
+        if: failure()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: review-environment-cleanup
+          recreate: true
+          message: |
+            **Review Environment Cleanup Failed:**
+
+            An error occurred during cleanup for branch `${{ github.head_ref }}` (closed).
+
+            Attempted App Name: `${{ needs.setup_review_database.outputs.app_name }}`
+            Attempted Schema: `${{ needs.setup_review_database.outputs.schema_name }}`
+            Attempted User: `${{ needs.setup_review_database.outputs.app_db_user }}`
+
+            Manual cleanup in Azure Resource Group `${{ env.AZURE_RESOURCE_GROUP_REVIEW }}` and the Review PostgreSQL database might be required! Check [Actions logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
